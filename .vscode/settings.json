@@ -1,0 +1,7 @@
+{
+  "python.defaultInterpreterPath": "D:\\applications\\miniforge3\\envs\\agent-training\\python.exe",
+  "python.terminal.activateEnvironment": true,
+  "python.analysis.extraPaths": [
+    "D:\\applications\\miniforge3\\envs\\agent-training\\Lib\\site-packages"
+  ]
+}

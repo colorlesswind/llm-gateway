@@ -22,6 +22,53 @@ uvicorn src.main:app --reload
 > 配置缺失（如未填 `DEEPSEEK_API_KEY`、`MODEL_CHAIN` 里写了未注册的模型）会在
 > **启动时**直接抛 `ConfigurationError`，不会等到第一个请求才失败。
 
+## Docker 部署
+
+镜像基于 `python:3.12-slim`，以非 root（uid 10001）运行，配置全部通过环境变量
+注入，`.env` 不会被打进镜像（见 `.dockerignore`）。
+
+```sh
+cp .env.example .env            # 填入真实 API Key
+docker compose up -d --build    # 构建并后台启动
+docker compose logs -f gateway  # 观察启动日志
+```
+
+访问 http://127.0.0.1:8000/docs。宿主机端口用 `GATEWAY_PORT` 覆盖，
+镜像 tag 用 `IMAGE_TAG` 覆盖：
+
+```sh
+GATEWAY_PORT=8080 IMAGE_TAG=0.2.0 docker compose up -d --build
+```
+
+不使用 compose 时：
+
+```sh
+docker build -t llm-gateway:latest .
+docker run -d --name llm-gateway -p 8000:8000 \
+  -v llm-gateway-data:/data \
+  -e DATABASE_URL=sqlite:////data/llm_gateway.db \
+  --env-file .env llm-gateway:latest
+```
+
+部署要点：
+
+- **持久化**：提示词模板库默认落在命名卷 `gateway-data` 的 `/data` 下。`.env`
+  里给本地开发写的 `sqlite:///./llm_gateway.db` 是相对路径，在容器里会指向只读的
+  `/app`，所以 compose 用 `GATEWAY_DATABASE_URL` 单独覆盖容器内路径。
+- **PostgreSQL**：镜像默认只装了 SQLite 所需驱动；改用
+  `postgresql+psycopg://...` 前需要在 `requirements.txt` 里加上
+  `psycopg[binary]` 重新构建。
+- **多进程 / 多副本**：`MAX_CONCURRENT_REQUESTS` 是**进程内**计数，总上限约为
+  `MAX_CONCURRENT_REQUESTS × UVICORN_WORKERS`；多副本部署时 SQLite 也不适用。
+- **探针**：`/health` 是存活检查（镜像 `HEALTHCHECK` 用它），`/ready` 会检查
+  数据库与模型注册表，未配置 `DATABASE_URL` 时返回 503，不适合做存活探针。
+- **优雅停机**：容器内 uvicorn 为 PID 1，`docker stop` 的 SIGTERM 会让在飞请求
+  （含 SSE）正常收尾，`stop_grace_period` 设为 20s。
+- **反向代理**：需要信任 `X-Forwarded-*` 时追加
+  `-e UVICORN_EXTRA_ARGS="--proxy-headers --forwarded-allow-ips=*"`。
+- **本机 ollama**：compose 已加 `host.docker.internal:host-gateway`，容器内可直接
+  用 `http://host.docker.internal:11434/v1` 作为 `OLLAMA_BASE_URL`。
+
 ## 架构
 
 ```mermaid

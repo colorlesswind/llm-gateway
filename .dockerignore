@@ -1,0 +1,28 @@
+# 版本控制 / 本地环境
+.git
+.gitignore
+.venv
+venv
+__pycache__
+*.py[cod]
+.pytest_cache
+.mypy_cache
+.ruff_cache
+
+# 密钥与本地配置：运行时通过 --env-file 或 compose env_file 注入
+.env
+.env.*
+!.env.example
+
+# 本地数据与日志
+*.db
+*.db-journal
+*.sqlite3
+*.log
+
+# 与运行镜像无关的文件
+tests
+README.md
+Dockerfile
+docker-compose.yml
+.dockerignore

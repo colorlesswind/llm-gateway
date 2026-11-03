@@ -1,0 +1,53 @@
+# docker compose up -d --build
+#
+# 配置来源优先级：environment（本文件）> env_file（.env）> 应用内默认值。
+# 也就是说 .env 提供全部业务配置，下面 environment 里列出的键以本文件为准。
+
+services:
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: llm-gateway:${IMAGE_TAG:-latest}
+    container_name: llm-gateway
+    restart: unless-stopped
+
+    # .env 不存在时也能启动（配置缺失会在启动期 fail fast，见 README）
+    env_file:
+      - path: .env
+        required: false
+
+    environment:
+      # 提示词模板库：默认落在命名卷 /data 下。
+      # 刻意不读 .env 里的 DATABASE_URL —— 那里通常写的是本地开发的相对路径
+      # （sqlite:///./llm_gateway.db），在容器里会指向只读的 /app。
+      # 要换 PostgreSQL：改这一行，并在镜像里额外安装 psycopg[binary]
+      # （见 requirements.txt 注释），例如
+      # postgresql+psycopg://user:pw@db:5432/llm_gateway
+      DATABASE_URL: ${GATEWAY_DATABASE_URL:-sqlite:////data/llm_gateway.db}
+      # 入口并发上限是进程内计数：总上限 ≈ MAX_CONCURRENT_REQUESTS × 该值
+      UVICORN_WORKERS: ${UVICORN_WORKERS:-1}
+
+    ports:
+      - "${GATEWAY_PORT:-8000}:8000"
+
+    volumes:
+      # SQLite / 运行期数据；多 worker 或多副本部署请改用 PostgreSQL
+      - gateway-data:/data
+
+    # 容器内可用 host.docker.internal 访问宿主机（如本机 ollama）
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    # 容器内端口固定 8000（镜像 CMD 用 PORT），宿主机端口由 GATEWAY_PORT 控制
+
+    stop_grace_period: 20s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  gateway-data:

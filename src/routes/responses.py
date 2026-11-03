@@ -10,9 +10,10 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException, Path, status
 from fastapi.responses import JSONResponse
 
-from src.routes.deps import Gateway
+from src.routes.deps import Gateway, OptionalPrompts, OptionalUserId
 from src.schemas import GenerateRequest, ResponseObject, ResponseRequest
 from src.services.llm_adaptor.translator import gateway_headers, to_response_object
+from src.services.prompts import prompt_headers, render_into_payload
 
 router = APIRouter(tags=["responses"])
 
@@ -36,6 +37,8 @@ router = APIRouter(tags=["responses"])
 async def create_response(
     payload: ResponseRequest,
     gateway: Gateway,
+    user_id: OptionalUserId,
+    prompts: OptionalPrompts,
     api_version: str = Path(..., description="API 版本，例如 v1"),
 ):
     if payload.stream:
@@ -56,10 +59,12 @@ async def create_response(
         max_tokens=payload.max_output_tokens,
         stream=False,
         structured_output=payload.structured_output,
+        prompt=payload.prompt,
         **(payload.model_extra or {}),
     )
+    unified, prompt_usage = await render_into_payload(unified, user_id, prompts)
     result = await gateway.complete(unified)
     return JSONResponse(
         content=to_response_object(result),
-        headers=gateway_headers(result),
+        headers={**gateway_headers(result), **prompt_headers(prompt_usage)},
     )

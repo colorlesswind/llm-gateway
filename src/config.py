@@ -98,6 +98,25 @@ class Settings(BaseSettings):
     # 具名 schema 注册表目录：SCHEMAS_DIR=<id>.json
     schemas_dir: str = "schemas"
 
+    # --- 提示词模板（用户上传 + 渲染注入） --------------------------------
+    # SQLAlchemy URL。留空表示未配置：客户端的 prompt 模板相关能力不可用
+    # （/ready 报 not_configured，prompts 接口返回 503 prompt_store_unavailable）。
+    # 例：sqlite:///./llm_gateway.db / postgresql+psycopg://user:pw@host/db
+    database_url: str = ""
+    # 单个模板正文的字节上限（UTF-8），超限直接 413
+    prompt_max_bytes: int = 256 * 1024
+    # 渲染后文本的字节上限，防止模板 + 变量拼出超长 system 提示词
+    prompt_max_rendered_bytes: int = 512 * 1024
+    # 每个用户可保存的模板数量上限
+    prompt_max_per_user: int = 200
+    # 模板读取的进程内缓存 TTL（秒）；0 表示关闭。多 worker 部署时更新
+    # 最多在 TTL 之后对其他进程生效。
+    prompt_cache_ttl: float = 30.0
+    # 进程内缓存的条目上限
+    prompt_cache_max_entries: int = 512
+    # 进程内缓存的总字节预算（按模板正文字节计），防止长模板把内存吃满
+    prompt_cache_max_bytes: int = 16 * 1024 * 1024
+
     @property
     def model_chain_list(self) -> list[str]:
         """解析后的候选模型优先级链。"""

@@ -48,6 +48,7 @@ GATEWAY_FIELDS = frozenset(
         "response_format",
         "stream",
         "structured_output",
+        "prompt",
     }
 )
 
@@ -162,6 +163,7 @@ def build_generate_request(payload: ChatCompletionRequest) -> GenerateRequest:
         top_p=payload.top_p,
         max_tokens=payload.max_tokens,
         structured_output=payload.structured_output,
+        prompt=payload.prompt,
         **(payload.model_extra or {}),
     )
 

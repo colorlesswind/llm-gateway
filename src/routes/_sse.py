@@ -9,7 +9,7 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Mapping
 
 from fastapi.responses import StreamingResponse
 
@@ -28,6 +28,7 @@ async def build_sse_response(
     encoder: Callable[[StreamEvent], str],
     *,
     terminator: str | None = None,
+    headers: Mapping[str, str] | None = None,
 ) -> StreamingResponse:
     try:
         first: StreamEvent | None = await events.__anext__()
@@ -53,7 +54,9 @@ async def build_sse_response(
             await aclose_stream(events)
 
     return StreamingResponse(
-        body(), media_type="text/event-stream", headers=dict(SSE_HEADERS)
+        body(),
+        media_type="text/event-stream",
+        headers={**SSE_HEADERS, **(headers or {})},
     )
 
 

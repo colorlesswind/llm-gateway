@@ -382,10 +382,11 @@ def test_unknown_chain_entry_fails_fast() -> None:
     assert "ghost" in str(excinfo.value)
 
 
-def test_get_prompt_returns_not_implemented() -> None:
+def test_get_prompt_without_database_returns_unavailable() -> None:
     client = build_client(lambda request: chat_ok())
     response = client.get("/v1/prompts/abc", headers={"X-User-Id": "user-1"})
-    assert response.status_code == 501
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "prompt_store_unavailable"
 
 
 @pytest.mark.parametrize(

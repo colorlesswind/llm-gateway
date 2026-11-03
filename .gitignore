@@ -10,5 +10,10 @@ __pycache__/
 # Env
 .env
 
+# Local database (DATABASE_URL=sqlite:///./llm_gateway.db)
+*.db
+*.db-wal
+*.db-shm
+
 # Editor
 .idea/

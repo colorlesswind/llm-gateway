@@ -9,13 +9,18 @@ from src.schemas import HealthResponse, ReadyResponse
 router = APIRouter(tags=["health"])
 
 
-async def check_database() -> bool:
-    """检查数据库连接是否就绪。
+async def check_database(request: Request) -> tuple[str, str | None]:
+    """返回 ``(状态, 说明)``，状态取 ``ok / unavailable / not_configured``。
 
-    TODO: 接入真实数据库后实现连接探测（例如执行一次 SELECT 1），
-    失败时返回 False，并区分“未配置”与“连接不可用”。
+    提示词模板是可选的：``DATABASE_URL`` 为空时进程仍然可以处理纯模型调用，
+    因此这里必须区分「未配置」与「配置了但连不上」，不能用同一个 503 掩盖。
     """
-    return False
+    service = getattr(request.app.state, "prompt_service", None)
+    if service is None:
+        return "not_configured", "未配置 DATABASE_URL，提示词模板能力不可用"
+    if await service.ping():
+        return "ok", None
+    return "unavailable", "数据库连接不可用"
 
 
 @router.get(
@@ -40,16 +45,15 @@ async def ready(request: Request, response: Response) -> ReadyResponse:
     models = len(gateway.registry.all_deployments) if gateway is not None else 0
     providers = "ok" if models else "not_configured"
 
-    # TODO: 数据库接入后，替换为真实的连接池/会话探测
-    database_ready = await check_database()
-    if not database_ready:
+    database, detail = await check_database(request)
+    if database != "ok":
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
         return ReadyResponse(
             status="not_ready",
-            database="not_configured",
+            database=database,  # type: ignore[arg-type]
             providers=providers,
             models=models,
-            detail="数据库连接尚未接入",
+            detail=detail,
         )
     return ReadyResponse(
         status="ready", database="ok", providers=providers, models=models

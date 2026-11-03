@@ -12,7 +12,7 @@ from fastapi import APIRouter, Path, status
 from fastapi.responses import JSONResponse
 
 from src.routes._sse import build_sse_response
-from src.routes.deps import Gateway, UserId
+from src.routes.deps import Gateway, OptionalPrompts, UserId
 from src.schemas import GenerateRequest, GenerateResponse
 from src.services.llm_adaptor import InvalidRequestError
 from src.services.llm_adaptor.translator import (
@@ -20,6 +20,7 @@ from src.services.llm_adaptor.translator import (
     gateway_headers,
     to_generate_payload,
 )
+from src.services.prompts import prompt_headers, render_into_payload
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +51,7 @@ async def generate(
     payload: GenerateRequest,
     gateway: Gateway,
     user_id: UserId,
+    prompts: OptionalPrompts,
     api_version: str = Path(..., description="API 版本，例如 v1"),
 ):
     # 鉴权已由 UserId 依赖完成（缺失/非法直接 401，不会触到上游）。
@@ -62,6 +64,10 @@ async def generate(
         payload.stream,
     )
 
+    # 模板渲染必须在建流之前完成：失败要能返回正确的 HTTP 状态码
+    payload, prompt_usage = await render_into_payload(payload, user_id, prompts)
+    extra_headers = prompt_headers(prompt_usage)
+
     if payload.stream:
         if payload.structured_output is not None:
             # 流式无法“收回已发出的 delta”，校验只能覆盖非流式返回
@@ -72,10 +78,11 @@ async def generate(
         return await build_sse_response(
             gateway.stream(payload),
             lambda event: encode_sse(event, requested_model=requested_model),
+            headers=extra_headers,
         )
 
     result = await gateway.complete(payload)
     return JSONResponse(
         content=to_generate_payload(result),
-        headers=gateway_headers(result),
+        headers={**gateway_headers(result), **extra_headers},
     )

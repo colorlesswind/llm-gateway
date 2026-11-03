@@ -8,7 +8,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 # ---------------------------------------------------------------------------
@@ -31,6 +31,40 @@ class ReadyResponse(BaseModel):
     providers: Literal["ok", "unavailable", "not_configured"] = "not_configured"
     models: int = 0
     detail: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# 提示词模板注入
+# ---------------------------------------------------------------------------
+class PromptInjection(BaseModel):
+    """在三个 LLM 入口上引用一个已上传的模板，并给出渲染参数。
+
+    - ``target``：渲染结果写到哪里。``system`` / ``instructions`` 等价，都会注入
+      system 消息（Responses 协议的 ``instructions`` 字段映射后同样是 system）；
+      ``user`` 写进首条 user 消息。
+    - ``position``：``prepend``（模板在前，推荐，利于上游 prompt cache）或
+      ``append``。
+    - ``on_missing``：变量缺失时 ``error``（默认，400）还是替换为空串。
+    - ``variables`` 中出现模板未声明的 key 一律报错，避免拼写错误被静默忽略。
+
+    **互斥**：与请求里已有的 system 内容（``instructions``、``messages`` /
+    ``input`` 中的 ``role=system``）不能同时出现，否则 400
+    ``prompt_instructions_conflict``。原因：不同厂商对「多条 system 消息」的处理
+    不一致，网关要求 system 提示只有一个来源。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(..., min_length=1, max_length=64, description="模板 ID")
+    version: int | None = Field(
+        default=None, ge=1, description="固定使用某个版本；缺省用最新版本"
+    )
+    variables: dict[str, Any] = Field(
+        default_factory=dict, description="模板占位符的取值"
+    )
+    target: Literal["system", "instructions", "user"] = "system"
+    position: Literal["prepend", "append"] = "prepend"
+    on_missing: Literal["error", "empty"] = "error"
 
 
 # ---------------------------------------------------------------------------
@@ -127,7 +161,11 @@ class ChatCompletionRequest(BaseModel):
         default=None,
         description="非流式的 JSON Schema 校验（流式请求不支持）",
     )
-    # TODO: 需要补充 gateway 自有扩展字段，例如 provider 覆盖、提示词注入开关
+    prompt: PromptInjection | None = Field(
+        default=None,
+        description="引用已上传的提示词模板并注入到 system 消息（与 instructions / system 消息互斥）",
+    )
+    # TODO: 需要补充 gateway 自有扩展字段，例如 provider 覆盖
 
 
 class ChatCompletionChoice(BaseModel):
@@ -179,6 +217,10 @@ class GenerateRequest(BaseModel):
     structured_output: StructuredOutput | None = Field(
         default=None,
         description="非流式的 JSON Schema 校验（流式请求不支持）",
+    )
+    prompt: PromptInjection | None = Field(
+        default=None,
+        description="引用已上传的提示词模板并注入到 system 消息（与 instructions / system 消息互斥）",
     )
 
     @model_validator(mode="after")
@@ -237,6 +279,10 @@ class ResponseRequest(BaseModel):
         default=None,
         description="非流式的 JSON Schema 校验（本入口只支持非流式）",
     )
+    prompt: PromptInjection | None = Field(
+        default=None,
+        description="引用已上传的提示词模板并注入到 system 消息（与 instructions / system 消息互斥）",
+    )
 
 
 class ResponseOutputItem(BaseModel):
@@ -281,28 +327,104 @@ class ModelListResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Prompts
+# Prompts（模板 CRUD）
 # ---------------------------------------------------------------------------
 class PromptCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     name: str = Field(..., min_length=1, max_length=128)
-    content: str = Field(..., min_length=1, description="提示词正文")
+    content: str = Field(
+        ...,
+        min_length=1,
+        # 字符级硬上限，挡住明显的超大请求；字节级上限由服务层按配置校验
+        max_length=1_000_000,
+        description="提示词正文，占位符写作 {{name}}",
+    )
     description: str | None = Field(default=None, max_length=512)
-    enabled: bool = Field(default=True, description="是否参与自动注入")
-    # TODO: 需要设计注入条件，例如按模型/厂商/请求标签匹配以及优先级
+    enabled: bool = Field(default=True, description="是否允许被请求引用")
+    variables: list[str] | None = Field(
+        default=None,
+        max_length=64,
+        description="可选的变量声明；提供时必须与模板中的占位符集合一致",
+    )
+
+    @field_validator("name")
+    @classmethod
+    def _clean_name(cls, value: str) -> str:
+        name = value.strip()
+        if not name:
+            raise ValueError("模板名称不能为空")
+        if any(ord(ch) < 32 or ord(ch) == 127 for ch in name):
+            raise ValueError("模板名称不能包含控制字符")
+        return name
+
+
+class PromptUpdateRequest(BaseModel):
+    """部分更新；``content`` 变化时会生成新版本（旧版本仍可按 version 引用）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str | None = Field(default=None, min_length=1, max_length=128)
+    content: str | None = Field(default=None, min_length=1, max_length=1_000_000)
+    description: str | None = Field(default=None, max_length=512)
+    enabled: bool | None = None
+    variables: list[str] | None = Field(default=None, max_length=64)
+    expected_version: int | None = Field(
+        default=None,
+        ge=1,
+        description="乐观锁：与当前 head_version 不一致时返回 409",
+    )
+
+    @field_validator("name")
+    @classmethod
+    def _clean_name(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        name = value.strip()
+        if not name:
+            raise ValueError("模板名称不能为空")
+        if any(ord(ch) < 32 or ord(ch) == 127 for ch in name):
+            raise ValueError("模板名称不能包含控制字符")
+        return name
 
 
 class Prompt(BaseModel):
+    """模板详情（含正文）。"""
+
     id: str
     user_id: str
     name: str
     content: str
     description: str | None = None
     enabled: bool = True
+    version: int = 1
+    content_hash: str = ""
+    variables: list[str] = Field(default_factory=list)
+    token_estimate: int = 0
+    created_at: datetime
+    updated_at: datetime
+
+
+class PromptSummary(BaseModel):
+    """列表项，**不含正文**，避免列表接口返回大量长文本。"""
+
+    id: str
+    user_id: str
+    name: str
+    description: str | None = None
+    enabled: bool = True
+    version: int = 1
+    content_hash: str = ""
+    variables: list[str] = Field(default_factory=list)
+    token_estimate: int = 0
     created_at: datetime
     updated_at: datetime
 
 
 class PromptListResponse(BaseModel):
     object: Literal["list"] = "list"
-    data: list[Prompt] = Field(default_factory=list)
+    data: list[PromptSummary] = Field(default_factory=list)
     total: int = 0
+    limit: int = 20
+    offset: int = 0
+

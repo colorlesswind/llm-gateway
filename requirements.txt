@@ -4,3 +4,5 @@ httpx>=0.27
 pydantic-settings>=2.4
 python-dotenv>=1.0
 jsonschema>=4.22
+# 提示词模板持久化（SQLite 用标准库驱动；PostgreSQL 另需 psycopg[binary]）
+sqlalchemy>=2.0

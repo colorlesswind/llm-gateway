@@ -12,7 +12,7 @@ from fastapi import APIRouter, Path, status
 from fastapi.responses import JSONResponse
 
 from src.routes._sse import build_sse_response
-from src.routes.deps import Gateway
+from src.routes.deps import Gateway, OptionalPrompts, OptionalUserId
 from src.schemas import ChatCompletionRequest, ChatCompletionResponse
 from src.services.llm_adaptor.translator import (
     build_generate_request,
@@ -20,6 +20,7 @@ from src.services.llm_adaptor.translator import (
     gateway_headers,
     to_chat_completion,
 )
+from src.services.prompts import prompt_headers, render_into_payload
 
 router = APIRouter(tags=["chat"])
 
@@ -40,9 +41,14 @@ router = APIRouter(tags=["chat"])
 async def create_chat_completion(
     payload: ChatCompletionRequest,
     gateway: Gateway,
+    user_id: OptionalUserId,
+    prompts: OptionalPrompts,
     api_version: str = Path(..., description="API 版本，例如 v1"),
 ):
     unified = build_generate_request(payload)
+    # 未带 prompt 时 user_id 仍可为空，保持对旧客户端的兼容
+    unified, prompt_usage = await render_into_payload(unified, user_id, prompts)
+    extra_headers = prompt_headers(prompt_usage)
 
     if payload.stream:
         chunk_id = f"chatcmpl-{uuid.uuid4().hex}"
@@ -51,10 +57,11 @@ async def create_chat_completion(
             gateway.stream(unified),
             lambda event: chat_chunk(event, chunk_id=chunk_id, model=model),
             terminator="data: [DONE]\n\n",
+            headers=extra_headers,
         )
 
     result = await gateway.complete(unified)
     return JSONResponse(
         content=to_chat_completion(result).model_dump(exclude_none=True),
-        headers=gateway_headers(result),
+        headers={**gateway_headers(result), **extra_headers},
     )

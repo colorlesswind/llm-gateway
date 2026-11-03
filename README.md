@@ -64,6 +64,13 @@ flowchart LR
 | `SCHEMA_REPAIR_ON_LENGTH` | `finish_reason=length` 时是否仍重试，默认 `false` |
 | `SCHEMA_SUM_USAGE` | 修复重试是否累加所有尝试的 `usage`，默认 `true` |
 | `SCHEMAS_DIR` | 具名 schema 注册表目录（`<schema_id>.json`），默认 `schemas` |
+| `DATABASE_URL` | 提示词模板存储的 SQLAlchemy URL，默认空（未配置）：`sqlite:///./llm_gateway.db` / `postgresql+psycopg://user:pw@host/db` |
+| `PROMPT_MAX_BYTES` | 单个模板正文的字节上限，默认 262144（256KB） |
+| `PROMPT_MAX_RENDERED_BYTES` | 渲染后文本的字节上限，默认 524288 |
+| `PROMPT_MAX_PER_USER` | 每个用户的模板数量上限，默认 200 |
+| `PROMPT_CACHE_TTL` | 模板读取的进程内缓存 TTL（秒），默认 30，0 表示关闭 |
+| `PROMPT_CACHE_MAX_ENTRIES` | 进程内缓存条目上限，默认 512 |
+| `PROMPT_CACHE_MAX_BYTES` | 进程内缓存正文总字节预算，默认 16MB |
 
 模型 ID 中的 `-` 与 `.` 在环境变量里写作 `_`，例如 `gpt-4o-mini` →
 `MODEL_GPT_4O_MINI_PROVIDER`。
@@ -76,7 +83,8 @@ flowchart LR
 | POST | `/{api_version}/chat/completions` | OpenAI 兼容入口（保留给现成 SDK） |
 | POST | `/{api_version}/responses` | responses 兼容入口，**仅非流式**，需开启 `ENABLE_RESPONSES_MODE` |
 | GET | `/{api_version}/models` | 注册表中的可用模型 |
-| POST/GET | `/{api_version}/prompts` | 提示词管理（待实现，501） |
+| POST/GET | `/{api_version}/prompts` | 提示词模板创建 / 列表（列表只返回摘要，不含正文） |
+| GET/PATCH/DELETE | `/{api_version}/prompts/{prompt_id}` | 模板详情 / 更新（正文变更生成新版本）/ 软删除 |
 | GET | `/health` | 存活检查 |
 | GET | `/ready` | 就绪检查（数据库 + 模型注册表） |
 
@@ -103,7 +111,8 @@ X-User-Id: user-123
 
 > 当前只做「形状」校验（非空、长度 ≤128、无控制字符）：header 由调用方自行声明，
 > **并不是可信凭证**。接入真实鉴权后应改为从 API key / JWT 中解析身份。
-> 兼容入口 `/chat/completions`、`/responses` 目前尚未强制校验该头。
+> 兼容入口 `/chat/completions`、`/responses` 的 `X-User-Id` 仍是可选的；
+> 但一旦请求引用提示词模板（`prompt`），就必须提供，否则 401 `missing_user_id`。
 
 也可以使用 responses 风格的输入：
 
@@ -248,6 +257,99 @@ data: {"type": "error", "code": "upstream_timeout", "message": "...", "retryable
   不会因为格式问题把模型熔断；
 - 流式调用的首包与事件间隔分别受 `FIRST_TOKEN_TIMEOUT` / `IDLE_TIMEOUT` 约束。
 
+## 提示词模板（上传 → 渲染 → 注入）
+
+用户可以把长文本模板存到网关，然后在三个会打上游的入口（`/generate`、
+`/chat/completions`、`/responses`）里通过 `prompt` 引用，渲染结果注入 system 消息
+（或首条 user 消息），从而让多个模型共用同一份模板。
+
+模板正文与版本**分表保存**（`prompt_templates` + `prompt_template_versions`）：
+修改正文会生成新版本，旧版本仍可按 `version` 引用，保证同一请求重放时结果可复现。
+
+### 1. 上传模板
+
+```jsonc
+POST /v1/prompts
+X-User-Id: user-123
+{
+  "name": "reviewer",
+  "content": "你是一名 {{role}}。\n要求：{{requirements}}",
+  "description": "代码评审人格",
+  "variables": ["role", "requirements"]   // 可省略，上传时自动解析
+}
+```
+
+返回 201：`id`（`ptpl_...`）、`version`、`content_hash`、`variables`、`token_estimate`。
+占位符写作 `{{name}}`；单个 `{` `}` 原样保留，提示词里可以直接写 JSON 示例。
+
+### 2. 查询
+
+```jsonc
+GET /v1/prompts?limit=20&offset=0&enabled=true   // 摘要列表，不含正文
+GET /v1/prompts/{prompt_id}                       // 详情（含正文）
+GET /v1/prompts/{prompt_id}?version=1             // 指定历史版本
+PATCH /v1/prompts/{prompt_id}                     // 更新；expected_version 做乐观锁
+DELETE /v1/prompts/{prompt_id}                    // 软删除，名称可复用
+```
+
+### 3. 在三个入口引用
+
+```jsonc
+POST /v1/generate
+X-User-Id: user-123
+{
+  "input": "帮我评审这段代码",
+  "prompt": {
+    "id": "ptpl_...",
+    "version": 1,          // 可选：固定版本，便于复现
+    "variables": {"role": "资深代码评审员", "requirements": "只关注正确性"},
+    "target": "system",    // system | instructions | user
+    "position": "prepend", // prepend | append
+    "on_missing": "error"  // error | empty
+  }
+}
+```
+
+模板即 system 提示：请求里**不能同时**提供 `instructions`，`messages` / `input` 里
+也不能再带非空的 `role=system` 消息，否则返回 400 `prompt_instructions_conflict`。
+这是刻意为之——不同厂商对「多条 system 消息」的处理不一致（按顺序拼接 / 只取第一条 /
+直接 400），网关要求 system 提示只有一个来源，保证上游始终只收到一条 system 消息。
+存在结构化输出时，最终顺序为 **模板 → 结构化 schema 约束 → 对话**；模板在最前面
+也利于命中上游的 prompt cache。响应头会带回
+`X-Gateway-Prompt-Id` / `X-Gateway-Prompt-Version` / `X-Gateway-Prompt-Bytes`，
+日志只记 id / 版本 / 哈希 / 字节数，**不记录正文与变量值**。
+
+### 4. 约束与错误码
+
+- **`prompt` 与 system 内容互斥**：同时传 `prompt` 和 `instructions`，或在
+  `messages` / `input` 里带非空 `role=system` 消息，一律 400
+  `prompt_instructions_conflict`；`error.conflict_source` 会指出冲突来源
+  （`instructions` / `messages` / `input`）。要复用原 system 提示，请把它的内容
+  并入模板正文；
+- 变量 key 必须是模板声明过的（拼写错误直接 400，不会静默忽略）；
+- `variables` 值支持字符串、数字、布尔、null、数组/对象（容器按紧凑 JSON 序列化），
+  其它类型 400；
+- `target=user` 会写入首条 user 消息；请求里没有 user 内容时 400；
+- 模板正文、渲染结果、每用户模板数量都有上限（见上表配置）；
+- 模板属于某个 `user_id`，他人访问一律 **404**（不返回 403，避免探测存在性）。
+
+| code | HTTP | 含义 |
+| --- | --- | --- |
+| `prompt_not_found` | 404 | 模板不存在或不属于当前用户 |
+| `prompt_disabled` | 409 | 模板已停用 |
+| `prompt_template_invalid` | 400 | 正文为空 / 占位符过多 |
+| `prompt_variables_invalid` | 400 | 变量缺失、多余或类型不支持 |
+| `prompt_render_failed` | 400 | 注入目标不存在（例如 target=user 但没有 user 消息） |
+| `prompt_instructions_conflict` | 400 | 同时使用了 `prompt` 与 `instructions` / system 消息 |
+| `prompt_too_large` | 413 | 正文或渲染结果超限 |
+| `prompt_name_conflict` | 409 | 同一用户下名称重复 |
+| `prompt_quota_exceeded` | 409 | 模板数量达到上限 |
+| `prompt_version_conflict` | 409 | 乐观锁冲突 |
+| `prompt_store_unavailable` | 503 | 未配置 `DATABASE_URL` 或数据库不可用 |
+
+> 多 worker 部署时，模板缓存是**进程内**的：更新后其他 worker 最多在
+> `PROMPT_CACHE_TTL` 秒后生效。需要强一致时请把 TTL 设为 0。
+
 ## 目录结构
 
 ```
@@ -273,6 +375,11 @@ src/
     providers/
       openai_compat.py        # 所有 OpenAI 兼容厂商
       openai_responses.py     # 原生 Responses API
+  services/prompts/
+    render.py                 # {{var}} 解析 / 渲染（纯函数）
+    store.py                  # SQLAlchemy Core 持久化（SQLite / PostgreSQL）
+    service.py                # 校验、配额、缓存、版本
+    inject.py                 # 渲染进 GenerateRequest（建流之前）
 ```
 
 ## 测试
@@ -282,7 +389,8 @@ python -m pytest -q
 ```
 
 测试全部离线（`httpx.MockTransport` 打桩上游），覆盖降级、429 退避、不可重试
-错误、流式中断不降级、responses 开关与启动期配置校验，以及结构化输出的
-校验 / 修复重试 / 能力降级 / 错误码。
+错误、流式中断不降级、responses 开关与启动期配置校验，结构化输出的
+校验 / 修复重试 / 能力降级 / 错误码，以及提示词模板的 CRUD、版本、隔离性
+与三个入口的渲染注入（存储用内存 SQLite）。
 
 
